@@ -1,0 +1,538 @@
+---
+title: "Driver Location Clustering"
+output: pdf_document
+date: "2025-08-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mongolite)
+library(jsonlite)
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(sf)
+library(dbscan)
+library(geosphere)
+library(ggplot2)
+library(tigris);options(tigris_use_cache = TRUE)
+
+#rm(list=setdiff(ls(), c("heartbeat", "heartbeats")))
+
+```
+
+
+Load Heartbeat
+```{r}
+# m = mongo(
+#   collection = "YOUR COLLECTION",
+#   db = "YOUR DB",
+#   url = "YOUR URL"
+# )
+# 
+# # Aggregation pipeline as JSON string
+# pipelineHb = '[
+# 
+# 
+#   {
+# 
+#     "$project": {
+# 
+#       "_id": 0,
+# 
+#       "asset_id": 1,
+# 
+#       "asset_external_id": 1,
+# 
+#       "timestamp": 1,
+# 
+#       "driver_id": 1,
+# 
+#       "attribute_event": "$data.attributes.event",
+# 
+#       "attribute_logged_at": "$data.attributes.logged_at",
+# 
+#       "attribute_heartbeat_id": "$data.attributes.heartbeat_id",
+# 
+#       "attribute_speed": "$data.attributes.speed",
+# 
+#       "attribute_odometer": "$data.attributes.odometer",
+# 
+#       "attribute_odometer_jump": "$data.attributes.odometer_jump",
+# 
+#       "attribute_heading": "$data.attributes.heading",
+# 
+#       "attribute_ignition": "$data.attributes.ignition",
+# 
+#       "attribute_rpm": "$data.attributes.rpm",
+# 
+#       "attribute_engine_hours": "$data.attributes.engine_hours",
+# 
+#       "attribute_engine_hours_jump": "$data.attributes.engine_hours_jump",
+# 
+#       "attribute_wheels_in_motion": "$data.attributes.wheels_in_motion",
+# 
+#       "attribute_accuracy": "$data.attributes.accuracy",
+# 
+#       "attribute_satellites": "$data.attributes.satellites",
+# 
+#       "attribute_gps_valid": "$data.attributes.gps_valid",
+# 
+#       "attribute_gps": "$data.attributes.gps",
+# 
+#       "attribute_hdop": "$data.attributes.hdop",
+# 
+#       "attribute_fuel_level": "$data.attributes.fuel_level",
+# 
+#       "attribute_total_fuel_used": "$data.attributes.total_fuel_used",
+# 
+#       "attribute_switched_battery_voltage": "$data.attributes.switched_battery_voltage",
+# 
+#       "attribute_cvd_power_supply_voltage": "$data.attributes.cvd_power_supply_voltage",
+# 
+#       "attribute_ambient_temperature": "$data.attributes.ambient_temperature",
+# 
+#       "attribute_rsrp_rssi": "$data.attributes.rsrp_rssi",
+# 
+#       "attribute_rssi": "$data.attributes.rssi",
+# 
+#       "attribute_store_and_forward": "$data.attributes.store_and_forward",
+# 
+#       "attribute_location_latitude": "$data.attributes.location.latitude",
+# 
+#       "attribute_location_longitude": "$data.attributes.location.longitude",
+# 
+#       "attribute_location_description": "$data.attributes.location.description",
+# 
+#       "attribute_location_country_code": "$data.attributes.location.country_code",
+# 
+#       "attribute_location_state_code": "$data.attributes.location.state_code",
+# 
+#       "attribute_location_relative_distance": "$data.attributes.location.relative_position.distance",
+# 
+#       "attribute_location_relative_unit": "$data.attributes.location.relative_position.unit_of_measure",
+# 
+#       "attribute_location_relative_direction": "$data.attributes.location.relative_position.direction",
+# 
+#       "attribute_location_relative_city": "$data.attributes.location.relative_position.city",
+# 
+#       "attribute_location_relative_state": "$data.attributes.location.relative_position.state_code",
+# 
+#       "attribute_location_relative_country": "$data.attributes.location.relative_position.country_code",
+# 
+#       "attribute_idle_duration_total": {
+# 
+#         "$reduce": {
+# 
+#           "input": "$data.attributes.idle_periods",
+# 
+#           "initialValue": 0,
+# 
+#           "in": { "$add": ["$$value", "$$this.duration"] }
+# 
+#         }
+# 
+#       }
+# 
+#     }
+# 
+#   }
+# 
+# ]'
+# 
+# # Run the aggregation
+# 
+# heartbeat = m$aggregate(pipelineHb)
+# 
+# # Export to CSV
+#heartbeat = heartbeat %>% arrange(driver_id, timestamp)
+# write.csv(heartbeat, "heartbeats_flat_expanded.csv", row.names = FALSE)
+
+
+heartbeat = data.table::fread("heartbeats_flat_expanded.csv")
+
+heartbeat0731 = heartbeat[as.Date(heartbeat$timestamp) == "2025-07-31",]
+heartbeat0801 = heartbeat[as.Date(heartbeat$timestamp) == "2025-08-01",]
+heartbeat0802 = heartbeat[as.Date(heartbeat$timestamp) == "2025-08-02",]
+heartbeat0803 = heartbeat[as.Date(heartbeat$timestamp) == "2025-08-03",]
+heartbeat0807 = heartbeat[as.Date(heartbeat$timestamp) == "2025-08-07",]
+heartbeat0808 = heartbeat[as.Date(heartbeat$timestamp) == "2025-08-08",]
+
+heartbeats = list(heartbeat0731,heartbeat0801,heartbeat0802,heartbeat0803,heartbeat0807,heartbeat0808)
+
+
+```
+
+
+Parameters
+```{r}
+# QC
+MAX_SPEED_MPS   = 45       # ~100 mph
+MAX_GAP_HOURS   = 6
+CONUS_BBOX      = c(xmin=-125, xmax=-66.5, ymin=24.5, ymax=49.5)
+
+# Trip classification
+LOCAL_THRESHOLD_KM = 300   # <= 300 km ⇒ "Local"
+N_SAMPLE_PER_TRIP  = 10     # evenly spaced in time
+
+# Clustering
+EPSG_CONUS     = 5070      # NAD83 / Conus Albers
+
+#Local
+EPS_LOCAL_EPSM = 3000      # meters
+MINPTS_LOCAL   = 25
+
+# Non-Local
+EPS_NONLOCAL_EPSM = 5000  # 5km
+MINPTS_NONLOCAL   = 25
+BORDERPOINTS_NONLOCAL = FALSE  
+
+
+```
+
+
+QC from heartbeat to gps_sf
+```{r}
+
+`%||%` = function(a,b) if (is.null(a)) b else a
+
+# Heuristics to find columns in case of upstream name change
+.pick_col = function(df, candidates) {
+  hit = intersect(names(df), candidates)
+  if (!length(hit)) stop("Missing required column. Tried: ", paste(candidates, collapse=", "))
+  hit[1]
+}
+
+qc_from_heartbeat = function(heartbeat, lat_col=NULL, lon_col=NULL, drv_col=NULL, ts_col=NULL,
+                              max_speed_mps=MAX_SPEED_MPS, max_gap_hours=MAX_GAP_HOURS) {
+
+  lat_col = lat_col %||% .pick_col(heartbeat, c("lat","latitude","attribute_location_latitude"))
+  lon_col = lon_col %||% .pick_col(heartbeat, c("lon","longitude","attribute_location_longitude"))
+  drv_col = drv_col %||% .pick_col(heartbeat, c("driver","driver_id","driverId"))
+  ts_col  = ts_col  %||% .pick_col(heartbeat, c("timestamp","ts","event_time","time"))
+
+  dt = as.data.table(heartbeat)[, .(
+    driver = get(drv_col),
+    ts     = lubridate::ymd_hms(as.character(get(ts_col)), quiet = TRUE, tz = "UTC"),
+    lat    = as.numeric(get(lat_col)),
+    lon    = as.numeric(get(lon_col))
+  )]
+
+  dt = dt[!is.na(driver) & !is.na(ts) & !is.na(lat) & !is.na(lon)]
+  dt = dt[between(lat, CONUS_BBOX["ymin"], CONUS_BBOX["ymax"]) &
+           between(lon, CONUS_BBOX["xmin"], CONUS_BBOX["xmax"])]
+  setkey(dt, driver, ts, lat, lon)
+  dt = unique(dt)
+  setorder(dt, driver, ts)
+
+  # initial lags
+  dt[, `:=`(lat_prev = shift(lat), lon_prev = shift(lon), ts_prev = shift(ts)), by = driver]
+  dt[, dt_s   := as.numeric(ts - ts_prev, units = "secs")]
+  dt[, bad_dt := !is.na(dt_s) & dt_s <= 0]
+  dt[, big_gap := !is.na(dt_s) & dt_s > (max_gap_hours * 3600)]
+
+  # drop big gaps and non-increasing timestamps
+  dt = dt[is.na(dt_s) | (!bad_dt & !big_gap)]
+
+  # recompute lags and speeds within contiguous segments
+  dt[, seg_id := cumsum(is.na(dt_s)), by = driver]
+  dt[, `:=`(lat_prev = shift(lat), lon_prev = shift(lon), ts_prev = shift(ts)), by = .(driver, seg_id)]
+  dt[, dt_s   := as.numeric(ts - ts_prev, units = "secs")]
+  dt[, dist_m := ifelse(is.na(lat_prev), NA_real_,
+                        geosphere::distHaversine(cbind(lon_prev, lat_prev), cbind(lon, lat)))]
+  dt[, speed_mps := fifelse(!is.na(dist_m) & !is.na(dt_s) & dt_s > 0, dist_m/dt_s, NA_real_)]
+  dt[, too_fast := !is.na(speed_mps) & speed_mps > max_speed_mps]
+
+  keep = dt[is.na(dt_s) | !too_fast]
+  sf::st_as_sf(keep, coords = c("lon","lat"), crs = 4326, remove = FALSE) |>
+    sf::st_zm(drop = TRUE)
+}
+
+
+#Run QC
+gps_sf = qc_from_heartbeat(heartbeats[[2]])
+
+
+```
+
+
+2) Urban Areas overlay + trip splitting
+```{r}
+# Census Urban Areas (2020), already CONUS by our bbox later
+ua_conus = tigris::urban_areas(year = 2020, class = "sf") |>
+  st_transform(5070) |>
+  st_make_valid()
+
+gps_proj = st_transform(gps_sf, 5070)
+st_agr(ua_conus) = "constant"
+ua_prepared = st_union(ua_conus)  # dissolve to single MULTIPOLYGON
+
+gps_sf$in_urban = st_within(gps_proj, ua_prepared, sparse = FALSE)[,1]  #This is slow. Should revisit
+
+
+# Split into daily trips (driver + date)
+gps_sf = gps_sf |>
+  mutate(date = as.Date(lubridate::with_tz(ts, "UTC"))) |>
+  arrange(driver, date, ts)
+
+gps_sf$trip_id = paste(gps_sf$driver, gps_sf$date, sep = "_")
+
+
+```
+
+
+3) Per-trip features (Urban %, max extent, Local/Non-local)
+```{r}
+trip_summary = gps_sf |>
+  group_by(trip_id, driver, date) |>
+  reframe({
+    grp = sf::st_as_sf(cur_data()) |> st_transform(EPSG_CONUS)
+    n_pts = nrow(grp)
+    urban_pct = mean(grp$in_urban, na.rm = TRUE) * 100
+    if (n_pts < 2) {
+      tibble(urban_pct = urban_pct, max_dist_km = 0, trip_type = "Local")
+    } else {
+      bb = st_bbox(grp)
+      p1 = c(bb["xmin"], bb["ymin"])
+      p2 = c(bb["xmax"], bb["ymax"])
+      # convert back to lon/lat only for distance in meters
+      p1_ll = st_coordinates(st_transform(st_sfc(st_point(p1), crs=EPSG_CONUS), 4326))
+      p2_ll = st_coordinates(st_transform(st_sfc(st_point(p2), crs=EPSG_CONUS), 4326))
+      max_dist_km = geosphere::distHaversine(p1_ll, p2_ll) / 1000
+      trip_type = ifelse(max_dist_km <= LOCAL_THRESHOLD_KM, "Local", "Non-local")
+      tibble(urban_pct = urban_pct, max_dist_km = max_dist_km, trip_type = trip_type)
+    }
+  }) |>
+  ungroup()
+
+
+```
+
+
+4) Per-class clustering (Non-local by region)
+```{r}
+run_dbscan = function(points_sf, eps_m, minPts, borderPoints = TRUE) {
+  if (!nrow(points_sf)) return(dplyr::mutate(points_sf, cluster = integer(0)))
+  coords = sf::st_coordinates(sf::st_transform(points_sf, EPSG_CONUS))
+  cl = dbscan::dbscan(coords, eps = eps_m, minPts = minPts, borderPoints = borderPoints)
+  dplyr::mutate(points_sf, cluster = cl$cluster, is_core = cl$isseed)
+}
+
+# Attach trip_type to points
+gps_sf = gps_sf |>
+  dplyr::left_join(trip_summary |> dplyr::select(trip_id, trip_type), by = "trip_id")
+
+
+# Local (unchanged)
+local_pts   = gps_sf |> dplyr::filter(trip_type == "Local")
+local_clust = run_dbscan(local_pts, eps_m = EPS_LOCAL_EPSM, minPts = MINPTS_LOCAL, borderPoints = TRUE)
+
+# Non-local: define regions + cluster per region
+
+states_sf = tigris::states(cb = TRUE, year = 2021) %>%
+  dplyr::filter(STUSPS %in% state.abb | STUSPS %in% c("DC")) %>%
+  sf::st_transform(4326)
+
+# Your custom regions:
+region_map = list(
+  Northeast = c("ME","NH","VT","MA","RI","CT","NY","NJ","DE","PA"),
+  RustBelt  = c("OH","MI","IN","IL","WI"),
+  DEEP_South     = c("FL","GA","AL","MS","SC"),
+  Mountain_Mama = c("DC","MD","VA","WV","NC","TN","KY"),
+  Midwest   = c("MN","IA","MO","ND","SD","NE","KS","CO","WY","MT","ID","UT"),
+  WestAZ    = c("CA","OR","WA","AZ","NV"),  # West Coast + AZ + NV
+  TXCorridor = c("NM","TX","OK","AR","LA")
+)
+
+# #Counting is hard
+# all_states = state.abb
+# assigned   = unlist(region_map, use.names = FALSE)
+# assigned_states = setdiff(assigned, "DC")  # drop DC if you only want states
+# 
+# missing    = setdiff(all_states, unique(assigned_states))
+# dupes      = names(which(table(assigned_states) > 1))
+# 
+# list(missing = missing, duplicates = dupes)
+
+
+states_sf$region = NA_character_
+for (r in names(region_map)) {
+  states_sf$region[states_sf$STUSPS %in% region_map[[r]]] = r
+}
+states_sf = states_sf %>% dplyr::filter(!is.na(region))
+
+nonlocal_pts = gps_sf %>% dplyr::filter(trip_type == "Non-local")
+
+# Assign region via point-in-state; if NA (coastline), snap to nearest state
+nonlocal_pts_reg = sf::st_join(nonlocal_pts, states_sf[, c("STUSPS","region")], left = TRUE)
+if (any(is.na(nonlocal_pts_reg$region))) {
+  na_idx = which(is.na(nonlocal_pts_reg$region))
+  nearest = sf::st_nearest_feature(nonlocal_pts_reg[na_idx,], states_sf)
+  nonlocal_pts_reg$region[na_idx] = states_sf$region[nearest]
+}
+
+# Run DBSCAN per region with Non-local params
+nl_split = split(nonlocal_pts_reg, nonlocal_pts_reg$region, drop = TRUE)
+nl_clust_list = lapply(nl_split, function(s) {
+  if (!nrow(s)) return(s)
+  run_dbscan(s,
+             eps_m        = EPS_NONLOCAL_EPSM,
+             minPts       = MINPTS_NONLOCAL,
+             borderPoints = BORDERPOINTS_NONLOCAL)
+})
+nonlocal_clust = dplyr::bind_rows(nl_clust_list)
+
+# Make Non-local cluster ids globally unique across regions (0 stays 0)
+region_code = setNames(seq_along(unique(nonlocal_clust$region)), unique(nonlocal_clust$region))
+nonlocal_clust = nonlocal_clust %>%
+  dplyr::mutate(reg_code = region_code[region],
+    cluster   = dplyr::if_else(cluster == 0L, 0L, as.integer(.data$`reg_code`*10000L + cluster))
+  ) %>%
+  dplyr::select(-`reg_code`)
+
+# Combine back
+clustered_all = dplyr::bind_rows(local_clust, nonlocal_clust)
+
+
+# Majority-vote cluster per trip
+#
+trip_clusters = clustered_all |>
+  sf::st_drop_geometry() |>
+  dplyr::count(trip_id, cluster, name = "n_pts") |>
+  dplyr::slice_max(n_pts, n = 1, with_ties = FALSE) |>
+  dplyr::select(trip_id, cluster)
+
+trip_summary = trip_summary |> dplyr::left_join(trip_clusters, by = "trip_id")
+
+```
+
+
+5) Sanity Check
+```{r}
+# Cluster size (points) and distinct trips per cluster
+pt_sizes = clustered_all |>
+  st_drop_geometry() |>
+  filter(cluster != 0) |>
+  count(trip_type, cluster, name = "n_pts")
+
+trip_sizes = clustered_all |>
+  st_drop_geometry() |>
+  filter(cluster != 0) |>
+  distinct(trip_type, cluster, trip_id) |>
+  count(trip_type, cluster, name = "n_trips")
+
+sizes = pt_sizes |> left_join(trip_sizes, by = c("trip_type","cluster"))
+
+sizes[sizes$trip_type == "Local",] %>% arrange(trip_type, desc(n_trips)) %>% head(20)
+sizes[sizes$trip_type == "Non-local",] %>% arrange(trip_type, desc(n_trips)) %>% head(20)
+
+gps_sf |>
+  st_drop_geometry() |>
+  count(driver, date, name = "n_pts_day") |>
+  summarize(q = quantile(n_pts_day, probs = c(.1,.25,.5,.75,.9)))
+
+
+```
+
+6) I'm The Map
+```{r}
+# FIXED helper: coerce all hulls to polygons (buffers POINT/LINESTRING) ---
+to_polygons = function(hulls_sf, crs_m = 5070, buf_m = 50) {
+  stopifnot(inherits(hulls_sf, "sf"))
+  if (!nrow(hulls_sf)) return(hulls_sf[0, ])
+
+  s = sf::st_transform(hulls_sf, crs_m)
+
+  # Identify non-polygon geometries and buffer only those (no ifelse on sfc)
+  gt  = sf::st_geometry_type(s, by_geometry = TRUE)
+  idx = !(gt %in% c("POLYGON","MULTIPOLYGON"))
+  if (any(idx)) {
+    s$geometry[idx] = sf::st_buffer(s$geometry[idx], buf_m)
+  }
+
+  s = sf::st_make_valid(s)
+  s = sf::st_collection_extract(s, "POLYGON")
+  s = s[!sf::st_is_empty(s), ]
+  sf::st_transform(s, 4326)
+}
+
+# Compute convex hulls per (trip_type, cluster)
+# - Works even if some clusters have < 3 pts (you'll get a line/point hull)
+# - Builds hulls in a projected CRS (EPSG 5070) for valid geometry/area
+# - Returns hulls back in EPSG:4326 for easy mapping
+make_cluster_hulls = function(points_sf,
+                               cluster_col = "cluster",
+                               type_col = "trip_type",
+                               crs_m = 5070) {
+  stopifnot(inherits(points_sf, "sf"))
+  if (!all(c(cluster_col, type_col) %in% names(points_sf))) {
+    stop("Expected columns not found: ", cluster_col, " and ", type_col)
+  }
+
+  pts = points_sf |>
+    filter(.data[[cluster_col]] != 0) |>
+    st_make_valid()
+
+  if (!nrow(pts)) return(pts[0, ])
+
+  # project to meters for robust hulls + area
+  pts_m = st_transform(pts, crs_m)
+
+  hulls_m = pts_m |>
+    group_by(.data[[type_col]], .data[[cluster_col]]) |>
+    summarise(
+      n_pts = dplyr::n(),
+      geometry = st_convex_hull(st_union(geometry)),
+      .groups = "drop"
+    ) |>
+    st_make_valid() |>
+    mutate(
+      area_km2 = as.numeric(st_area(geometry)) / 1e6,
+      cluster_chr = as.character(.data[[cluster_col]])
+    )
+
+  st_transform(hulls_m, 4326)
+}
+
+# Build hulls
+cluster_hulls = make_cluster_hulls(clustered_all,
+                                    cluster_col = "cluster",
+                                    type_col = "trip_type",
+                                    crs_m = EPSG_CONUS)
+
+hulls_local    = cluster_hulls |> dplyr::filter(trip_type == "Local")     |> to_polygons(crs_m = EPSG_CONUS, buf_m = 50)
+hulls_nonlocal = cluster_hulls |> dplyr::filter(trip_type == "Non-local") |> to_polygons(crs_m = EPSG_CONUS, buf_m = 100)
+
+states_ll = tigris::states(cb = TRUE, year = 2021) |>
+  dplyr::filter(STUSPS %in% c(state.abb, "DC")) |>
+  sf::st_transform(4326)
+
+xlim_conus = c(-125, -66.5); ylim_conus = c(24.5, 49.5)
+
+p_local = ggplot2::ggplot() +
+  ggplot2::geom_sf(data = states_ll, fill = NA, color = "grey70", linewidth = 0.2) +
+  ggplot2::geom_sf(data = hulls_local, aes(fill = trip_type), alpha = 0.25, color = NA) +
+  ggplot2::geom_sf(data = hulls_local, fill = NA, color = "black", linewidth = 0.25) +
+  ggplot2::coord_sf(xlim = xlim_conus, ylim = ylim_conus, expand = FALSE) +
+  ggplot2::guides(fill = "none") +
+  ggplot2::labs(title = "Local Cluster Convex Hulls",
+                subtitle = "Tiny clusters buffered to small polygons") +
+  ggplot2::theme_minimal()
+
+p_nonlocal = ggplot2::ggplot() +
+  ggplot2::geom_sf(data = states_ll, fill = NA, color = "grey70", linewidth = 0.2) +
+  ggplot2::geom_sf(data = hulls_nonlocal, aes(fill = trip_type), alpha = 0.25, color = NA) +
+  ggplot2::geom_sf(data = hulls_nonlocal, fill = NA, color = "black", linewidth = 0.25) +
+  ggplot2::coord_sf(xlim = xlim_conus, ylim = ylim_conus, expand = FALSE) +
+  ggplot2::guides(fill = "none") +
+  ggplot2::labs(title = "Non-local Cluster Convex Hulls",
+                subtitle = "Tiny clusters buffered to small polygons") +
+  ggplot2::theme_minimal()
+
+p_local
+p_nonlocal
+
+
+```
+
+

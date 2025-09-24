@@ -1,0 +1,514 @@
+---
+title: "Driver Performance"
+output: pdf_document
+date: "2025-08-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)  # reproducible split/CV
+
+# Core libs
+library(dplyr)
+library(xgboost)
+library(vip)
+library(data.table)
+
+# I/O and utilities
+library(mongolite)
+library(jsonlite)
+
+```
+
+#Load in data if needed
+
+Driver Performance
+```{r}
+# --- Data load ---------------------------------------------------------------
+# Option A (default): cached CSV (fast, repeatable)
+res = read.csv("dperf.csv")
+
+# Option B: pull from MongoDB (uncomment to refresh the cache)
+# url = "mongodb://YOUR URL/YOUR COLLECTION?authSource=YOUR DB"
+# m = mongo(collection = "YOUR COLLECTION", db = "YOUR DB", url = url)
+# pipe = list(
+#   list(`$match` = list(`data.type` = "driver_performance", valid = TRUE)),
+#   list(`$project` = list(
+#     `_id` = 0,
+#     asset_id = 1, asset_external_id = 1, driver_id = 1, driver_external_id = 1,
+#     vin = 1, timestamp = 1,
+#     start_time = "$data.attributes.start_time",
+#     end_time   = "$data.attributes.end_time",
+#     short_idle_time = "$data.attributes.data_extract.short_idle_time",
+#     short_idle_count = "$data.attributes.data_extract.short_idle_count",
+#     pto_time = "$data.attributes.data_extract.pto_time",
+#     total_idle_time = "$data.attributes.data_extract.total_idle_time",
+#     coast_out_gear_time = "$data.attributes.data_extract.coast_out_gear_time",
+#     moving_time = "$data.attributes.data_extract.moving_time",
+#     stop_idle_fuel_used = "$data.attributes.data_extract.stop_idle_fuel_used",
+#     total_fuel_used = "$data.attributes.data_extract.total_fuel_used",
+#     over_speed_time = "$data.attributes.data_extract.over_speed_time",
+#     drive_time = "$data.attributes.data_extract.drive_time",
+#     cruise_control_time = "$data.attributes.data_extract.cruise_control_time",
+#     stop_idle_time = "$data.attributes.data_extract.stop_idle_time",
+#     stop_idle_count = "$data.attributes.data_extract.stop_idle_count",
+#     stop_idle_warning_count = "$data.attributes.data_extract.stop_idle_warning_count",
+#     over_rpm_count = "$data.attributes.data_extract.over_rpm_count",
+#     over_rpm_time = "$data.attributes.data_extract.over_rpm_time",
+#     distance_drive = "$data.attributes.data_extract.distance_drive",
+#     engine_time = "$data.attributes.data_extract.engine_time",
+#     over_speed_count = "$data.attributes.data_extract.over_speed_count",
+#     top_gear_time = "$data.attributes.data_extract.top_gear_time",
+#     avg_engine_load = "$data.attributes.data_extract.avg_engine_load"
+#   ))
+# )
+# res = m$aggregate(toJSON(pipe, auto_unbox = TRUE))
+# write.csv(res, "dperf.csv", row.names = FALSE)  # refresh cache
+
+
+
+```
+
+
+Clean out bad entries
+```{r}
+# --- Basic filtering ---------------------------------------------------------
+# Keep trips that are long enough and have valid fuel usage
+trips = res %>%
+  filter(distance_drive > 100, total_fuel_used > 0) %>%
+  arrange(driver_id) %>%
+  mutate(mpg = distance_drive / total_fuel_used) %>%
+  filter(mpg < 15)  # drop outliers by business rule
+
+# Quick sanity peek (comment out if noisy)
+quantile(trips$mpg, seq(0, 1, .1), na.rm = TRUE)
+
+```
+
+
+Feature Engineering
+```{r}
+# --- Feature engineering -----------------------------------------------------
+# Goal: build directionally interpretable ratios/rates so we can assign stable weights.
+fe = trips %>%
+  mutate(
+    # Coerce to numeric (protects against character-typed columns)
+    drive_time          = as.numeric(drive_time),       # minutes moving
+    engine_time         = as.numeric(engine_time),      # minutes engine on
+    distance_drive      = as.numeric(distance_drive),   # miles
+
+    cruise_control_time = as.numeric(cruise_control_time),
+    total_idle_time     = as.numeric(total_idle_time),
+    top_gear_time       = as.numeric(top_gear_time),
+    coast_out_gear_time = as.numeric(coast_out_gear_time),
+
+    over_speed_time     = as.numeric(over_speed_time),
+    over_speed_count    = as.numeric(over_speed_count),
+
+    over_rpm_time       = as.numeric(over_rpm_time),
+    over_rpm_count      = as.numeric(over_rpm_count),
+
+    stop_idle_warning_count = as.numeric(stop_idle_warning_count)
+  ) %>%
+  # Safe denominators (avoid division by zero)
+  mutate(
+    d_drive  = ifelse(drive_time  > 0, drive_time,  NA_real_),
+    d_engine = ifelse(engine_time > 0, engine_time, NA_real_),
+    d_dist   = ifelse(distance_drive > 0, distance_drive, NA_real_)
+  ) %>%
+  # Ratios / rates aligned with business levers
+  mutate(
+    # Better driving = more cruise/top gear; worse = more idle/over-speed/over-rpm
+    cruise_control_ratio = cruise_control_time   / d_drive,
+    idle_ratio           = total_idle_time       / d_engine,
+    top_gear_ratio       = top_gear_time         / d_drive,
+    coast_ratio          = coast_out_gear_time   / d_drive,
+
+    overspeed_ratio      = over_speed_time       / d_drive,
+    overspeed_per_100m   = over_speed_count      / (d_dist / 100),
+
+    overrpm_ratio        = over_rpm_time         / d_engine,
+    overrpm_per_100m     = over_rpm_count        / (d_dist / 100),
+
+    overidle_per_100m    = stop_idle_warning_count / (d_dist / 100),
+
+    # Fleet speed profile: level + “too slow / too fast” hinges
+    avg_mph              = d_dist / (d_drive / 60),     # miles per hour
+    underspeed_excess    = pmax(45 - avg_mph, 0),
+    overspeed_excess     = pmax(avg_mph - 65, 0),
+
+    # Training weights: weight observations by trip distance (impact proxy)
+    trip_weight          = d_dist
+  ) %>%
+  # Keep only features we model + target
+  select(
+    mpg,
+    cruise_control_ratio,
+    idle_ratio,
+    top_gear_ratio,
+    coast_ratio,
+    overspeed_ratio, overspeed_per_100m,
+    overrpm_ratio,  overrpm_per_100m,
+    overidle_per_100m,
+    avg_mph, underspeed_excess, overspeed_excess,
+    trip_weight
+  ) %>%
+  # Guardrails on obviously bad speeds (helps robustness)
+  mutate(
+    avg_mph = pmin(pmax(avg_mph, 0), 90),
+    underspeed_excess = pmin(underspeed_excess, 45),
+    overspeed_excess  = pmin(overspeed_excess, 45)
+  ) %>%
+  filter(complete.cases(.))
+
+
+
+```
+
+
+Splitting
+```{r}
+# --- Train/validation split --------------------------------------------------
+n = nrow(fe)
+idx_train = sample.int(n, size = floor(0.8 * n))
+
+feat_cols = setdiff(colnames(fe), c("mpg", "trip_weight"))
+
+X_train = as.matrix(fe[idx_train, feat_cols])
+y_train = fe$mpg[idx_train]
+w_train = fe$trip_weight[idx_train]
+
+X_valid = as.matrix(fe[-idx_train, feat_cols])
+y_valid = fe$mpg[-idx_train]
+w_valid = fe$trip_weight[-idx_train]
+
+dtrain = xgb.DMatrix(data = X_train, label = y_train, weight = w_train)
+dvalid = xgb.DMatrix(data = X_valid, label = y_valid, weight = w_valid)
+
+
+
+```
+
+
+Monotone Constraints
+```{r}
+# --- Monotone constraints ----------------------------------------------------
+# Sign expectations: +1 should raise mpg; -1 should reduce mpg; 0 = allow either.
+mono_named = c(
+  cruise_control_ratio =  1,
+  idle_ratio           = -1,
+  top_gear_ratio       =  1,
+  coast_ratio          =  0,
+
+  overspeed_ratio      = -1,
+  overspeed_per_100m   = -1,
+
+  overrpm_ratio        = -1,
+  overrpm_per_100m     = -1,
+
+  overidle_per_100m    = -1,
+
+  avg_mph              =  0,  # level term; hinges handle direction
+  underspeed_excess    = -1,
+  overspeed_excess     = 0
+)
+mono_vec = unname(replace(mono_named[feat_cols], is.na(mono_named[feat_cols]), 0))
+
+
+
+```
+
+
+CV, nrounds
+```{r}
+params_cv = list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.06,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 3,
+  monotone_constraints = mono_vec
+)
+
+set.seed(42)
+cv = xgb.cv(
+  params = params_cv,
+  data = xgb.DMatrix(as.matrix(fe[, feat_cols]), label = fe$mpg, weight = fe$trip_weight),
+  nrounds = 3000,
+  nfold = 5,
+  early_stopping_rounds = 80,
+  verbose = 1
+)
+best_iter = cv$best_iteration
+cat(sprintf("CV best_iter = %d | CV test RMSE = %.4f\n",
+            best_iter, cv$evaluation_log$test_rmse_mean[best_iter]))
+
+
+```
+
+
+Run and Evaluate
+```{r}
+# --- Train final model -------------------------------------------------------
+params = list(
+  objective = "reg:squarederror",   # use "reg:pseudohubererror" if outliers dominate
+  eval_metric = "rmse",
+  eta = 0.08,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 3,
+  monotone_constraints = mono_vec
+)
+
+nrounds_final = if (exists("best_iter")) best_iter else 2000
+
+bst = xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds_final,
+  watchlist = list(train = dtrain, valid = dvalid),
+  early_stopping_rounds = 80,
+  verbose = 1
+)
+
+# --- Validation metrics (unweighted + weighted by trip distance) ------------
+pred  = predict(bst, dvalid)
+rmse  = sqrt(mean((pred - y_valid)^2))
+mae   = mean(abs(pred - y_valid))
+r2    = 1 - sum((pred - y_valid)^2) / sum((y_valid - mean(y_valid))^2)
+
+wrmse = sqrt(weighted.mean((pred - y_valid)^2, w_valid))
+wmae  = weighted.mean(abs(pred - y_valid), w_valid)
+
+cat(sprintf("Valid RMSE: %.4f | MAE: %.4f | R^2: %.4f\n", rmse, mae, r2))
+cat(sprintf("Weighted RMSE: %.4f | Weighted MAE: %.4f\n", wrmse, wmae))
+
+
+
+```
+
+
+Gauge feature importance
+```{r}
+# --- Unified importance: Gain + Permutation + SHAP --------------------------
+imp_gain = xgb.importance(model = bst, feature_names = feat_cols) %>%
+  dplyr::select(Feature, Gain, Cover, Frequency)
+
+set.seed(42)
+vip_perm = vi_permute(
+  object        = bst,
+  feature_names = feat_cols,
+  train         = as.data.frame(X_valid),
+  target        = y_valid,
+  metric        = "rmse",
+  pred_wrapper  = function(mod, newdata) predict(mod, as.matrix(newdata)),
+  nsim          = 30,
+  keep          = TRUE
+) %>% dplyr::rename(Feature = Variable, Permutation = Importance)
+
+shap_mat = predict(bst, xgb.DMatrix(X_valid), predcontrib = TRUE)
+shap_df  = as.data.frame(shap_mat)[, setdiff(colnames(shap_mat), "BIAS")]
+shap_abs_wmean = sapply(feat_cols, function(f) weighted.mean(abs(shap_df[[f]]), w = w_valid))
+imp_shap = tibble::tibble(Feature = feat_cols, SHAP_abs_wmean = shap_abs_wmean[feat_cols])
+
+imp_all = imp_gain %>%
+  dplyr::full_join(vip_perm, by = "Feature") %>%
+  dplyr::full_join(imp_shap, by = "Feature") %>%
+  dplyr::mutate(
+    Gain_norm        = Gain        / sum(Gain,        na.rm = TRUE),
+    Permutation_norm = Permutation / sum(Permutation, na.rm = TRUE),
+    SHAP_norm        = SHAP_abs_wmean / sum(SHAP_abs_wmean, na.rm = TRUE)
+  ) %>%
+  dplyr::arrange(dplyr::desc(SHAP_norm))
+
+print(imp_all)
+
+
+```
+
+
+Spearman rank agreement
+```{r}
+# Spearman rank agreement across methods (higher = better)
+tbl = imp_all[, c("Feature","Gain_norm","Permutation_norm","SHAP_norm")]
+rank_df = data.frame(
+  Feature = tbl$Feature,
+  rank_gain = rank(-tbl$Gain_norm, ties.method="average"),
+  rank_perm = rank(-tbl$Permutation_norm, ties.method="average"),
+  rank_shap = rank(-tbl$SHAP_norm, ties.method="average")
+)
+cat(sprintf("Spearman rho: gain~perm=%.2f, gain~shap=%.2f, perm~shap=%.2f\n",
+            cor(rank_df$rank_gain, rank_df$rank_perm, method="spearman"),
+            cor(rank_df$rank_gain, rank_df$rank_shap, method="spearman"),
+            cor(rank_df$rank_perm, rank_df$rank_shap, method="spearman")))
+
+```
+
+
+
+Monotonicity Audit
+```{r}
+# Monotonicity audit: SHAP vs feature value correlation (Spearman/Kendall)
+# Expect negative correlation for "bad" features (↑feature ⇒ ↓mpg), positive for "good".
+expect_neg = c("idle_ratio","overrpm_per_100m","overrpm_ratio",
+                "overspeed_per_100m","overspeed_ratio",
+                "underspeed_excess","overspeed_excess","overidle_per_100m")
+expect_pos = c("cruise_control_ratio","top_gear_ratio")
+expect_neu = c("coast_ratio","avg_mph")  # ambiguous or intentionally handled via hinges
+
+present = intersect(colnames(shap_df), feat_cols)
+audit_list = lapply(present, function(f){
+  v  = X_valid[, f]
+  sh = shap_df[[f]]
+  data.frame(
+    Feature = f,
+    Spearman = suppressWarnings(cor(v, sh, method="spearman", use="complete.obs")),
+    Kendall  = suppressWarnings(cor(v, sh, method="kendall",  use="complete.obs")),
+    Expect   = if (f %in% expect_neg) "neg" else if (f %in% expect_pos) "pos" else "neu",
+    stringsAsFactors = FALSE
+  )
+})
+audit = do.call(rbind, audit_list)
+
+audit$Pass = with(audit, ifelse(
+  Expect == "neg", Spearman <= -0.2,
+  ifelse(Expect == "pos", Spearman >=  0.2, TRUE)  # neutral: always pass
+))
+audit = audit[order(audit$Expect, -abs(audit$Spearman)), ]
+print(audit)
+
+
+```
+
+
+```{r}
+# Quick PD monotonicity check (univariate, coarse grid)
+pd_check = function(feature, grid = 20L) {
+  xv = X_valid
+  rng = quantile(xv[, feature], probs = c(0.05, 0.95), na.rm = TRUE)
+  xs = seq(rng[1], rng[2], length.out = grid)
+  preds = sapply(xs, function(x){
+    xv[, feature] = x
+    mean(predict(bst, as.matrix(xv)))
+  })
+  data.frame(x = xs, yhat = preds)
+}
+
+# Example for a "neg" feature
+pd_idle = pd_check("idle_ratio")
+# Optional: smoother PD grid
+# pd_check("idle_ratio", grid = 30L)
+
+is_nonincreasing = all(diff(pd_idle$yhat) <= 1e-6)
+cat(sprintf("idle_ratio PD non-increasing: %s\n", is_nonincreasing))
+
+```
+
+
+Put the weights in the bag bro
+```{r}
+#set.seed(123)
+B = 50  # increase to 200 for final
+
+# Define feature groups to avoid double counting correlated proxies
+groups = list(
+  idle         = intersect(c("idle_ratio", "overidle_per_100m"), feat_cols),
+  speed_level  = intersect(c("avg_mph", "underspeed_excess", "overspeed_excess"), feat_cols),
+  overspeed    = intersect(c("overspeed_ratio", "overspeed_per_100m"), feat_cols),
+  rpm          = intersect(c("overrpm_ratio", "overrpm_per_100m"), feat_cols),
+  cruise       = intersect(c("cruise_control_ratio"), feat_cols),
+  coast        = intersect(c("coast_ratio"), feat_cols),
+  top_gear     = intersect(c("top_gear_ratio"), feat_cols)
+)
+
+boot_weights = vector("list", B)
+
+for (b in seq_len(B)) {
+  n = nrow(fe)
+  idx_boot = sample.int(n, replace = TRUE, size = n)
+  idx_oob  = setdiff(seq_len(n), unique(idx_boot))
+  if (length(idx_oob) < max(30, length(feat_cols))) next  # skip tiny OOB
+
+  Xb   = as.matrix(fe[idx_boot, feat_cols])
+  yb   = fe$mpg[idx_boot]
+  wb   = if ("trip_weight" %in% colnames(fe)) fe$trip_weight[idx_boot] else rep(1, length(idx_boot))
+
+  Xoob = as.matrix(fe[idx_oob, feat_cols])
+  woob = if ("trip_weight" %in% colnames(fe)) fe$trip_weight[idx_oob] else rep(1, length(idx_oob))
+
+  dboot = xgb.DMatrix(Xb, label = yb, weight = wb)
+
+  params_boot = list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = 0.08,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 3,
+    monotone_constraints = unname(replace(mono_named[feat_cols], is.na(mono_named[feat_cols]), 0))
+  )
+
+  bst_b = xgb.train(params = params_boot, data = dboot, nrounds = 800, verbose = 0)
+
+  # SHAP on OOB for unbiased global attribution
+  shap_b = predict(bst_b, xgb.DMatrix(Xoob), predcontrib = TRUE)
+  shap_b = as.data.frame(shap_b)
+  shap_b = shap_b[, setdiff(colnames(shap_b), "BIAS")]
+
+  # Weighted mean |SHAP| per feature
+  w_abs = sapply(feat_cols, function(f) weighted.mean(abs(shap_b[[f]]), w = woob, na.rm = TRUE))
+
+  # Grouped weights (sum within group)
+  grp_w = sapply(groups, function(gs) if (length(gs)) sum(w_abs[gs]) else 0)
+
+  # Normalize to sum=1
+  boot_weights[[b]] = list(
+    feature = w_abs / sum(w_abs, na.rm = TRUE),
+    group   = grp_w / sum(grp_w, na.rm = TRUE)
+  )
+}
+
+# Aggregate bootstrap results
+stacked_feat = do.call(rbind, lapply(boot_weights, function(x) x$feature)) %>% as.data.frame()
+if (nrow(stacked_feat) > 0) {
+  feat_stats = data.frame(
+    Feature = colnames(stacked_feat),
+    Mean   = apply(stacked_feat, 2, mean, na.rm = TRUE),
+    Median = apply(stacked_feat, 2, median, na.rm = TRUE),
+    P05    = apply(stacked_feat, 2, quantile, probs = 0.05, na.rm = TRUE),
+    P95    = apply(stacked_feat, 2, quantile, probs = 0.95, na.rm = TRUE)
+  ) %>% dplyr::arrange(dplyr::desc(Median))
+  print(feat_stats)
+}
+
+stacked_grp = do.call(rbind, lapply(boot_weights, function(x) x$group)) %>% as.data.frame()
+if (nrow(stacked_grp) > 0) {
+  grp_stats = data.frame(
+    Group  = names(groups),
+    Mean   = apply(stacked_grp, 2, mean, na.rm = TRUE),
+    Median = apply(stacked_grp, 2, median, na.rm = TRUE),
+    P05    = apply(stacked_grp, 2, quantile, probs = 0.05, na.rm = TRUE),
+    P95    = apply(stacked_grp, 2, quantile, probs = 0.95, na.rm = TRUE)
+  ) %>% dplyr::arrange(dplyr::desc(Median))
+  print(grp_stats)
+}
+
+```
+
+Group weights
+```{r}
+if (exists("grp_stats")) {
+  score_weights = grp_stats %>%
+    dplyr::transmute(component = Group, weight = pmax(Median, 0)) %>%
+    dplyr::mutate(weight = weight / sum(weight, na.rm = TRUE),
+                  weight_100 = round(100 * weight, 1))
+  print(score_weights)
+}
+```
+
+
+

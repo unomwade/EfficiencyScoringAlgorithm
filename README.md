@@ -15,6 +15,7 @@ Driver Performance – generating feature weights for efficiency scoring using m
 The overall goal is to turn raw telematics data into meaningful, fair insights about driver behavior and efficiency.
 
 Notebooks
+
 Driver Location Clustering (Driver Location Clustering.Rmd)
 
 Purpose: Identify geographic hotspots so drivers are only compared against peers who operate in similar areas.

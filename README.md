@@ -1,70 +1,69 @@
-# EfficiencyScoringAlgorithm
-Algorithm for geographic clustering and feature weight determination for generating scoring rules 
+EfficiencyScoringAlgorithm
 
-This repository contains R Markdown notebooks for analyzing and modeling driver telematics data, but the idea can be easily abstracted to other subjects.
-The purpose of this iteration was to create a scoring method for driver efficiency that was agnostic towards differences in geography to eliminate unfair comparisons amongst driver in the CONUS. 
-It covers two main areas:
+Algorithm for geographic clustering and feature weight determination for generating scoring rules.
 
-Driver Location Clustering – Creates clusters based on geospatial data of trips drivers take to partition scoring/ranking.
+This repository contains R Markdown notebooks for analyzing and modeling driver telematics data. The method can be easily generalized to other applications beyond drivers.
 
-Driver Performance – Uses machine learning and SHAP to create feature weights for scoring and then applies statistical tests for sanity checks.
+The purpose of this iteration was to build a scoring method for driver efficiency that is agnostic to geography, so drivers across different regions can be compared fairly.
 
-The goal is to make sense of raw telematics data and extract insights about driver behavior and performance
+The project has two main components:
+
+Driver Location Clustering – partitioning drivers into comparable groups using geospatial event clustering.
+
+Driver Performance – generating feature weights for efficiency scoring using machine learning and SHAP, followed by statistical validation.
+
+The overall goal is to turn raw telematics data into meaningful, fair insights about driver behavior and efficiency.
 
 Notebooks
-1. Driver Location Clustering (Driver Location Clustering.Rmd)
+Driver Location Clustering (Driver Location Clustering.Rmd)
 
-Purpose: Identify hotspots so that drivers can be compared amongst themselves.
+Purpose: Identify geographic hotspots so drivers are only compared against peers who operate in similar areas.
 
 Key steps:
 
 Load heartbeat/event data from MongoDB or local cache.
 
-Extract driver IDs, timestamps, and event attributes.
+Extract driver IDs, timestamps, and attributes.
 
-Apply geospatial clustering (DBSCAN) to group nearby events.
+Apply DBSCAN for spatial clustering.
 
-Map event clusters using shapefiles (sf, tigris) for context.
+Overlay clusters on maps using shapefiles (sf, tigris).
 
-Visualize hotspots and movement patterns with ggplot2.
+Visualize clusters and movement patterns with ggplot2.
 
 
 
-2. Driver Performance (Driver Performance.Rmd)
+Driver Performance (Driver Performance.Rmd)
 
-Purpose: Create feature weights for scoring by using xgboost and SHAP with MPG as a target variable. I tried maximizing R^2 as we are not interested in predicting MPG, but defining feature importance. 
+Purpose: Derive feature weights for efficiency scoring, using MPG as a target only to surface feature importance (not to predict MPG).
 
 Key steps:
 
-Load performance data (dperf.csv) or pull directly from MongoDB.
+Load performance data (dperf.csv) or pull from MongoDB.
 
-Feature engineering with dplyr/data.table.
+Engineer features with dplyr / data.table.
 
-Train predictive models with xgboost.
+Train xgboost models.
 
-Assess model performance and feature importance (vip)
+Use SHAP / feature importance (vip) to determine weights.
 
-Statistical testing and bootstrapping for verification
-
-
+Run statistical tests and bootstrapping to validate results.
 
 Setup
 Requirements
 
-R (≥ 4.0)
+R ≥ 4.0
 
-Recommended: RStudio for running .Rmd files
+RStudio recommended for working with .Rmd files
 
-Packages used:
-dplyr
-xgboost
-vip
-data.table
-mongolite
-jsonlite
-lubridate
-sf
-dbscan
-geosphere
-ggplot2
-tigris
+Packages
+
+Core: dplyr, data.table, jsonlite, lubridate
+
+Database: mongolite
+
+Geospatial: sf, dbscan, geosphere, tigris
+
+Modeling & explanation: xgboost, vip
+
+Visualization: ggplot2

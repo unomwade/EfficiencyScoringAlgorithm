@@ -41,6 +41,3 @@ The goal of this project is to turn raw telematics data into meaningful, fair in
 | Modeling & Explanation| `xgboost`, `vip`                             |
 | Visualization         | `ggplot2`                                     |
 
-## Notes
-- This project demonstrates the ability to **generate actionable insights from raw data quickly**.  
-- The scoring methodology can be adapted to other domains requiring fair comparison across heterogeneous groups.
